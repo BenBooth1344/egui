@@ -29,6 +29,8 @@ type AxisFormatter = Option<Box<AxisFormatterFn>>;
 type GridSpacerFn = dyn Fn(GridInput) -> Vec<GridMark>;
 type GridSpacer = Box<GridSpacerFn>;
 
+use crate::plot::AxisPosition::AtCross;
+
 /// Specifies the coordinates formatting when passed to [`Plot::coordinates_formatter`].
 pub struct CoordinatesFormatter {
     function: Box<dyn Fn(&PlotPoint, &PlotBounds) -> String>,
@@ -211,10 +213,22 @@ pub struct Plot {
     label_formatter: LabelFormatter,
     coordinates_formatter: Option<(Corner, CoordinatesFormatter)>,
     axis_formatters: [AxisFormatter; 2],
+    axis_positions: [AxisPosition; 2],
     legend_config: Option<Legend>,
     show_background: bool,
     show_axes: [bool; 2],
     grid_spacers: [GridSpacer; 2],
+
+    line_min_alpha: f32,
+    line_max_alpha: f32,
+    label_min_alpha: f32,
+    label_max_alpha: f32,
+}
+
+pub enum AxisPosition {
+    Low,
+    High,
+    AtCross,
 }
 
 impl Plot {
@@ -245,11 +259,47 @@ impl Plot {
             label_formatter: None,
             coordinates_formatter: None,
             axis_formatters: [None, None], // [None; 2] requires Copy
+            axis_positions: [AtCross, AtCross],
             legend_config: None,
             show_background: true,
             show_axes: [true; 2],
             grid_spacers: [log_grid_spacer(10), log_grid_spacer(10)],
+
+            line_min_alpha: 0.0,
+            line_max_alpha: 0.15,
+            label_min_alpha: 0.0,
+            label_max_alpha: 0.4,
         }
+    }
+
+    pub fn x_axis_position(mut self, x_axis_position: AxisPosition) -> Self {
+        self.axis_positions[0] = x_axis_position;
+        self
+    }
+
+    pub fn y_axis_position(mut self, y_axis_position: AxisPosition) -> Self {
+        self.axis_positions[1] = y_axis_position;
+        self
+    }
+
+    pub fn line_min_alpha(mut self, line_min_alpha: f32) -> Self {
+        self.line_min_alpha = line_min_alpha;
+        self
+    }
+
+    pub fn line_max_alpha(mut self, line_max_alpha: f32) -> Self {
+        self.line_max_alpha = line_max_alpha;
+        self
+    }
+
+    pub fn label_min_alpha(mut self, label_min_alpha: f32) -> Self {
+        self.label_min_alpha = label_min_alpha;
+        self
+    }
+
+    pub fn label_max_alpha(mut self, label_max_alpha: f32) -> Self {
+        self.label_max_alpha = label_max_alpha;
+        self
     }
 
     /// width / height ratio of the data.
@@ -540,11 +590,16 @@ impl Plot {
             label_formatter,
             coordinates_formatter,
             axis_formatters,
+            axis_positions,
             legend_config,
             show_background,
             show_axes,
             linked_axes,
             grid_spacers,
+            line_min_alpha,
+            line_max_alpha,
+            label_min_alpha,
+            label_max_alpha,
         } = self;
 
         // Determine the size of the plot in the UI
@@ -815,9 +870,14 @@ impl Plot {
             label_formatter,
             coordinates_formatter,
             axis_formatters,
+            axis_positions,
             show_axes,
             transform: transform.clone(),
             grid_spacers,
+            line_min_alpha,
+            line_max_alpha,
+            label_min_alpha,
+            label_max_alpha,
         };
         prepared.ui(ui, &response);
 
@@ -1115,9 +1175,15 @@ struct PreparedPlot {
     label_formatter: LabelFormatter,
     coordinates_formatter: Option<(Corner, CoordinatesFormatter)>,
     axis_formatters: [AxisFormatter; 2],
+    axis_positions: [AxisPosition; 2],
     show_axes: [bool; 2],
     transform: ScreenTransform,
     grid_spacers: [GridSpacer; 2],
+
+    line_min_alpha: f32,
+    line_max_alpha: f32,
+    label_min_alpha: f32,
+    label_max_alpha: f32,
 }
 
 impl PreparedPlot {
@@ -1181,7 +1247,12 @@ impl PreparedPlot {
 
         // Where on the cross-dimension to show the label values
         let bounds = transform.bounds();
-        let value_cross = 0.0_f64.clamp(bounds.min[1 - axis], bounds.max[1 - axis]);
+
+        let value_cross = match self.axis_positions[axis] {
+            AxisPosition::AtCross => 0.0_f64.clamp(bounds.min[1 - axis], bounds.max[1 - axis]),
+            AxisPosition::High => bounds.max[1 - axis] as f64,
+            AxisPosition::Low => bounds.min[1 - axis] as f64,
+        };
 
         let input = GridInput {
             bounds: (bounds.min[axis], bounds.max[axis]),
@@ -1204,7 +1275,7 @@ impl PreparedPlot {
             let line_alpha = remap_clamp(
                 spacing_in_points,
                 (MIN_LINE_SPACING_IN_POINTS as f32)..=300.0,
-                0.0..=0.15,
+                self.line_min_alpha..=self.line_max_alpha,
             );
 
             if line_alpha > 0.0 {
@@ -1217,7 +1288,11 @@ impl PreparedPlot {
                 shapes.push(Shape::line_segment([p0, p1], Stroke::new(1.0, line_color)));
             }
 
-            let text_alpha = remap_clamp(spacing_in_points, 40.0..=150.0, 0.0..=0.4);
+            let text_alpha = remap_clamp(
+                spacing_in_points,
+                40.0..=150.0,
+                self.label_min_alpha..=self.label_max_alpha,
+            );
 
             if text_alpha > 0.0 {
                 let color = color_from_alpha(ui, text_alpha);
