@@ -1,5 +1,5 @@
 //! Simple plotting library.
-
+pub mod decoration;
 use std::{cell::Cell, ops::RangeInclusive, rc::Rc};
 
 use crate::*;
@@ -17,6 +17,8 @@ pub use items::{
 pub use legend::{Corner, Legend};
 pub use transform::PlotBounds;
 
+use self::decoration::{allocate_space_and_decorator_for_plot, AxisPosition, Decorator};
+
 mod items;
 mod legend;
 mod transform;
@@ -28,8 +30,6 @@ type AxisFormatter = Option<Box<AxisFormatterFn>>;
 
 type GridSpacerFn = dyn Fn(GridInput) -> Vec<GridMark>;
 type GridSpacer = Box<GridSpacerFn>;
-
-use crate::plot::AxisPosition::AtCross;
 
 /// Specifies the coordinates formatting when passed to [`Plot::coordinates_formatter`].
 pub struct CoordinatesFormatter {
@@ -225,12 +225,6 @@ pub struct Plot {
     label_max_alpha: f32,
 }
 
-pub enum AxisPosition {
-    Low,
-    High,
-    AtCross,
-}
-
 impl Plot {
     /// Give a unique id for each plot within the same [`Ui`].
     pub fn new(id_source: impl std::hash::Hash) -> Self {
@@ -259,7 +253,7 @@ impl Plot {
             label_formatter: None,
             coordinates_formatter: None,
             axis_formatters: [None, None], // [None; 2] requires Copy
-            axis_positions: [AtCross, AtCross],
+            axis_positions: [AxisPosition::AtCross, AxisPosition::AtCross],
             legend_config: None,
             show_background: true,
             show_axes: [true; 2],
@@ -626,8 +620,8 @@ impl Plot {
             vec2(width, height)
         };
 
-        // Allocate the space.
-        let (rect, response) = ui.allocate_exact_size(size, Sense::drag());
+        let (rect, response, decorator) =
+            allocate_space_and_decorator_for_plot(ui, size, &axis_positions, 30.0);
 
         // Load or initialize the memory.
         let plot_id = ui.make_persistent_id(id_source);
@@ -874,6 +868,7 @@ impl Plot {
             show_axes,
             transform: transform.clone(),
             grid_spacers,
+            decorator,
             line_min_alpha,
             line_max_alpha,
             label_min_alpha,
@@ -1179,6 +1174,7 @@ struct PreparedPlot {
     show_axes: [bool; 2],
     transform: ScreenTransform,
     grid_spacers: [GridSpacer; 2],
+    decorator: Decorator,
 
     line_min_alpha: f32,
     line_max_alpha: f32,
@@ -1189,10 +1185,11 @@ struct PreparedPlot {
 impl PreparedPlot {
     fn ui(self, ui: &mut Ui, response: &Response) {
         let mut shapes = Vec::new();
+        let mut shapes_outer = Vec::new();
 
         for d in 0..2 {
             if self.show_axes[d] {
-                self.paint_axis(ui, d, &mut shapes);
+                self.paint_axis(ui, d, &mut shapes, &mut shapes_outer);
             }
         }
 
@@ -1210,6 +1207,7 @@ impl PreparedPlot {
 
         let painter = ui.painter().with_clip_rect(*transform.frame());
         painter.extend(shapes);
+        self.decorator.outside_painter.extend(shapes_outer);
 
         if let Some((corner, formatter)) = self.coordinates_formatter.as_ref() {
             if let Some(pointer) = response.hover_pos() {
@@ -1228,7 +1226,13 @@ impl PreparedPlot {
         }
     }
 
-    fn paint_axis(&self, ui: &Ui, axis: usize, shapes: &mut Vec<Shape>) {
+    fn paint_axis(
+        &self,
+        ui: &Ui,
+        axis: usize,
+        shapes: &mut Vec<Shape>,
+        shapes_outer: &mut Vec<Shape>,
+    ) {
         let Self {
             transform,
             axis_formatters,
@@ -1252,6 +1256,8 @@ impl PreparedPlot {
             AxisPosition::AtCross => 0.0_f64.clamp(bounds.min[1 - axis], bounds.max[1 - axis]),
             AxisPosition::High => bounds.max[1 - axis] as f64,
             AxisPosition::Low => bounds.min[1 - axis] as f64,
+            AxisPosition::OutsideLow => bounds.min[1 - axis] as f64,
+            AxisPosition::OutsideHigh => bounds.max[1 - axis] as f64,
         };
 
         let input = GridInput {
@@ -1278,6 +1284,7 @@ impl PreparedPlot {
                 self.line_min_alpha..=self.line_max_alpha,
             );
 
+            let line_stroke: Stroke;
             if line_alpha > 0.0 {
                 let line_color = color_from_alpha(ui, line_alpha);
 
@@ -1285,7 +1292,10 @@ impl PreparedPlot {
                 let mut p1 = pos_in_gui;
                 p0[1 - axis] = transform.frame().min[1 - axis];
                 p1[1 - axis] = transform.frame().max[1 - axis];
-                shapes.push(Shape::line_segment([p0, p1], Stroke::new(1.0, line_color)));
+                line_stroke = Stroke::new(1.0, line_color);
+                shapes.push(Shape::line_segment([p0, p1], line_stroke));
+            } else {
+                line_stroke = Stroke::none();
             }
 
             let text_alpha = remap_clamp(
@@ -1305,16 +1315,29 @@ impl PreparedPlot {
 
                 // Custom formatters can return empty string to signal "no label at this resolution"
                 if !text.is_empty() {
-                    let galley = ui.painter().layout_no_wrap(text, font_id.clone(), color);
+                    // let decorator draw axis grid labels if desired
+                    if !self.decorator.add_axis_grid_label(
+                        ui,
+                        pos_in_gui,
+                        &text,
+                        &self.axis_positions,
+                        color,
+                        line_stroke,
+                        axis,
+                        shapes_outer,
+                    ) {
+                        let galley = ui.painter().layout_no_wrap(text, font_id.clone(), color);
 
-                    let mut text_pos = pos_in_gui + vec2(1.0, -galley.size().y);
+                        let mut text_pos = pos_in_gui + vec2(1.0, -galley.size().y);
+                        // Make sure we see the labels, even if the axis is off-screen:
+                        text_pos[1 - axis] = text_pos[1 - axis]
+                            .at_most(
+                                transform.frame().max[1 - axis] - galley.size()[1 - axis] - 2.0,
+                            )
+                            .at_least(transform.frame().min[1 - axis] + 1.0);
 
-                    // Make sure we see the labels, even if the axis is off-screen:
-                    text_pos[1 - axis] = text_pos[1 - axis]
-                        .at_most(transform.frame().max[1 - axis] - galley.size()[1 - axis] - 2.0)
-                        .at_least(transform.frame().min[1 - axis] + 1.0);
-
-                    shapes.push(Shape::galley(text_pos, galley));
+                        shapes.push(Shape::galley(text_pos, galley));
+                    }
                 }
             }
         }
